@@ -1,162 +1,184 @@
-c+  
-+  Name:             tiny-vreg-controller.c
-+  Version:          0.2
-+  Mikrocontroller:  ATtiny25V/45V/85V
-+  Takt:             1MHz
-+  Fuses:            -U lfuse:w:0x62:m -U hfuse:w:0xdf:m -U efuse:w:0xff:m  (default value)
-+  Programmierung:   Johannes S. (joh.raspi - forum-raspberrypi.de)
-+  Datum:            10. Oktober 2015
-+  Changelog:
-+  * TIMER Reset ersetzt durch zweiten Aufweck-Pin
-+
-+  Getestet mit der Arduino IDE v1.6.5
-+  Voraussetzung zum kompilieren: ATtiny unterstützung ist installiert.
-+  (Am besten über den neuen Boards Manager machen: Tools->Board:...->Boards Manager->"attiny")
-+  
-+  Pinout:                                             
-+                   +-------------+                     
-+                 +-+ (PB5)   VCC +-+  VBAT +           
-+                   | (Reset)     |                     
-+                   |             |                     
-+  WAKEUP2        +-+ PB3     PB2 +-+  VREG/LDO Enable (OUTPUT)    
-+  (INPUT)          |                     
-+                   |             |                     
-+  VREG Shutdown  +-+ PB4     PB1 +-+  WAKEUP Switch State (OUTPUT)
-+  (INPUT)          |             |                     
-+                   |             |                     
-+  GND            +-+ GND     PB0 +-+  WAKEUP Switch (INPUT)       
-+                   +-------------+                     
-+  
-+  Pin Funktionen:
-+  PB0 - WAKEUP Switch       - Taster oder Schalter über den der ATtiny aus dem Tiefschlaf geweckt wird
-+  PB1 - WAKEUP Switch State - Der Zustand des Schalters wird auch auf diesem Pin ausgegeben
-+  PB2 - VREG Enable         - Muss mit dem (active high) Enable/Shutdown Pin des Spannungsreglers verbunden werden
-+  PB3 - WAKEUP2             - Zweiter Aufweck-Pin. Kann genutzt werden um den ATtiny bspw. über einen RTC Alarm aufzuwecken
-+  PB4 - VREG Shutdown       - Ein kurzes HIGH Signal an diesem Pin schaltet den Spannungsreglers ab
-+
-+  Ablauf:
-+  1. -> Der ATtiny wird durch einen PinChange(PC) Interrupt (Wechsel sowohl von HIGH nach LOW als auch umgekehrt möglich) am Pin PB0 oder PB3 geweckt.
-+  2. -> Der Tiny setzt PB2 auf HIGH und aktiviert dadurch den Spannungsregler (und somit den ESP).
-+  3. -> Jetzt wird gewartet bis (vom ESP) ein Signal über PB4 kommt dass ihn veranlasst den Regler wieder abzuschalten,
-         Ausserdem wird der Zustand des Schalters(PB0) immer wieder neu eingelesen und über PB1 ausgegeben.
-+  4. -> Ist nach "timerInterval" Sekunden noch kein Signal gekommen wird der Spannungsregler um Strom zu sparen vom tiny wieder abgeschaltet -> PB2 geht auf LOW
-+        Zusätzlich wird auch PB1 auf LOW gesetzt (deaktiviert den Spannungsteiler/Pegelwandler)
-+  5. -> Zu guter letzt geht der ATtiny wieder in den Tiefschlaf(Power-down) und wartet auf den nächsten Interrupt. 
-+        Der Stromverbrauch des ATtiny liegt während er schläft bei ca. ~300nA @3.8V. Im Datenblatt steht genauers.
-+
-**************************************************************************************************************/
+// ATTINY "Smart" Wake-up routine
+// Adjustable active time
+// Triggerable Shutdown
+// Activatable by either watchdog (Time elapsed) or PB0 or PB3 Pin Change
+// Code copied and modified from:
+// 1. http://blog.onlinux.fr
+// 2. Johannes S. (joh.raspi - forum-raspberrypi.de)
+// 
+//+  Pinout:                                             
+//+                   +-------------+                     
+//+                 +-+ (PB5)   VCC +-+  VBAT +           
+//+                   | (Reset)     |                     
+//+                   |             |                     
+//+  WAKEUP2        +-+ PB3     PB2 +-+  VREG/LDO Enable (OUTPUT)    
+//+  (INPUT)          |                     
+//+                   |             |                     
+//+  VREG Shutdown  +-+ PB4     PB1 +-+  WAKEUP Switch State (OUTPUT)
+//+  (INPUT)          |             |                     
+//+                   |             |                     
+//+  GND            +-+ GND     PB0 +-+  WAKEUP Switch (INPUT)       
+//+                   +-------------+                     
+//+  
+//+  Pin Function:
+//+  PB0 - WAKEUP Switch       - Wakes ATTINY from Deep Sleep when state changes
+//+  PB1 - WAKEUP Switch State - Forward Wakeup Switch over this pin for upstream components
+//+  PB2 - VREG Enable         - Connect to Power Regulator (LDO) to enable power to upstream components
+//+  PB3 - WAKEUP2             - Second Wakeup pin
+//+  PB4 - VREG Shutdown       - A short signal on this pin will turn of the power regulator
+//+
+//+  Functies:
+//+  1. -> The ATTINY is woken up after a Pin Change Interrupt from Pin PB0 or PB3, or if the Watchdog Timer expires
+//+  2. -> ATTINY sets PB2 HIGH to activate the Power Regulator (And thereby powers the ESP
+//+  3. -> Now ATTINY will wait for a signal from the ESP on pin PB4 to shutdown the Power Regulator.
+//         In the meantime the state from PB0 is still being outputted on PB1.
+//+  4. -> When after the expiration of "timerInterval" number of seconds no signal is received on PB4 the Power Regulator will be shut down (PB2 goes LOW)
+//+        When the power is turned off, also PB1 is set to LOW again.
+//+  5. -> Now the ATTINY goes to deep sleep. waiting for the next interrupt to wake the chip.
+//+        The power consumption of the ATTiny lies around ~300nA & 3.8V. Please check the datasheet for exact details.
+//+
+//**************************************************************************************************************/
 
 #include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <avr/interrupt.h>  
+#ifndef cbi
+#define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
+#endif
+#ifndef sbi
+#define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
+#endif
+//
+// W H Y  V O L A T I L E ?
+//
+// Why volatile?
+// ---->
+// https://www.arduino.cc/en/Reference/Volatile
+// volatile keyword:
+// Specifically, it directs the compiler to load the variable from RAM and not from a storage register,
+// which is a temporary memory location where program variables are stored and manipulated. 
+// Under certain conditions, the value for a variable stored in registers can be inaccurate.
+ 
+volatile boolean f_wdt = 1;
 
-//++++++++++++++++++++++++++++++++++++++++
-// Pin Konfiguration
-//++++++++++++++++++++++++++++++++++++++++
+
+// How many seconds does the Power Regulator need to stay on?
+const unsigned long timerInterval = 1800;
+// How many seconds does the ATTINY sleep if there is no pin change on PB0 and PB3 (Multiple of 8 seconds)?
+const unsigned long sleepDuration = 16;
+ 
+// Setup Vatiables
 const int WAKEUP_SWITCH = 0;
+const int WAKEUP_SW2 = 3;
 const int WAKEUP_SWITCH_STATE = 1;
 const int VREG_ENABLE = 2;
-const int WAKEUP2 = 3;
 const int VREG_SHTDN = 4;
-
-// Anzahl Sekunden nach denen der Spannungsregler automatisch wieder abgeschaltet wird
-const unsigned long timerInterval = 60;
-//++++++++++++++++++++++++++++++++++++++++
-
-// Arbeitsvariablen
 unsigned long start_time;
 boolean goto_sleep = true;
+ 
 
-//++++++++++++++++++++++++++++++++++++++++
-// PinChange ISR - Einstiegspunkt nach dem Tiefschlaf
-ISR (PCINT0_vect) {}
-
-//++++++++++++++++++++++++++++++++++++++++
-// SETUP FUNCTION
-//++++++++++++++++++++++++++++++++++++++++
-void setup() 
+/******************************************************************/
+// 0=16ms, 1=32ms,2=64ms,3=128ms,4=250ms,5=500ms
+// 6=1 sec,7=2 sec, 8=4 sec, 9= 8sec
+void setup_watchdog(int ii) {
+ 
+  byte bb;
+  int ww;
+  if (ii > 9 ) ii=9;
+  bb=ii & 7;
+  if (ii > 7) bb|= (1<<5);
+  bb|= (1<<WDCE);
+  ww=bb;
+ 
+  MCUSR &= ~(1<<WDRF);
+  // start timed sequence
+  WDTCR |= (1<<WDCE) | (1<<WDE);
+  // set new watchdog timeout value
+  WDTCR = bb;
+  WDTCR |= _BV(WDIE);
+} 
+ 
+void system_sleep() {
+  //cbi(ADCSRA,ADEN);                    // switch Analog to Digitalconverter OFF to save power
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN); // sleep mode is set here
+  sleep_enable();
+  sleep_mode();                        // System sleeps here, waiting for interrupt
+  sleep_disable();                     // System continues execution here when watchdog timed out 
+  //sbi(ADCSRA,ADEN);                    // switch Analog to Digitalconverter ON to make it available again in the code.
+}
+ 
+// Watchdog Interrupt Service / is executed when watchdog timed out
+ISR(WDT_vect) {
+  f_wdt=1;  // set global flag to regocnize watchdog had timed out
+}
+ 
+ 
+void setup()
 {
-  // GPIOs konfigurieren
+  setup_watchdog(9);
+  // Configure GPIO's
   pinMode(VREG_ENABLE, OUTPUT);
   pinMode(VREG_SHTDN, INPUT);
   pinMode(WAKEUP_SWITCH_STATE, OUTPUT);
   pinMode(WAKEUP_SWITCH, INPUT);
-  //digitalWrite(WAKEUP_SWITCH, HIGH);  // Pullup Widerstand für den Aufweck Pin
-  pinMode(WAKEUP2, INPUT);
-  digitalWrite(WAKEUP2, HIGH);
-  
-  // AD Wandler abschalten (benötigt nur unnötig Strom, ~230µA)
-  ADCSRA &= ~(1<<ADEN);
-  
-  // Schlafmodus(Power-down) konfigurieren
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
-  
-  // PinChange(PC) Interrupts erlauben
-  GIMSK |= (1<<PCIE);
+  digitalWrite(WAKEUP_SWITCH, HIGH);  // Activate internal pullup resistor (Prefer to use NO/NC Reed Switch because this lowers power consumption) 
+  PCMSK |= ((1<<PCINT0) | (1<<PCINT3));  //                     Pin Change Mask Register
+  ADCSRA &= ~(1<<ADEN);    // Turn off AD Converter as I do not use it in this project
+  GIFR   |= bit (PCIF);    // clear any outstanding interrupts  General Interrupt Flag Register
+  GIMSK  |= bit (PCIE);    // enable pin change interrupts      General Interrupt Mask Register
+  sei();                   // enable interrupts
 }
-
-//++++++++++++++++++++++++++++++++++++++++
-// MAIN LOOP
-//++++++++++++++++++++++++++++++++++++++++
-void loop() 
+ 
+ISR (PCINT0_vect){}
+ 
+void loop()
 {
-  //++++++++++++++++++++++++++++++++++++++++
-  // Schlafen gehen ?
-  //++++++++++++++++++++++++++++++++++++++++
-  if (goto_sleep == true)  
-  {
-    // Spannungsregler abschalten
+  if (goto_sleep == true){  
+    // Disable power switch
     digitalWrite(VREG_ENABLE, LOW);
-    // Spannungsteiler abschalten
+    // Turn off Forward for REED Switch
     digitalWrite(WAKEUP_SWITCH_STATE, LOW);
-
-    //++++++++++++++++++++++++++++++++++++++++
-    // Auf PC Interrupt an PB0 und PB3 reagieren
-    PCMSK |= ((1<<PCINT0) | (1<<PCINT3));
-    
-    // Schlafmodus aktivieren
-    sleep_enable();
-    // Tiefschlaf aktivieren und auf den PC Interrupt warten
-    sleep_mode();
-    
-    // Kommt der Interrupt wird die PC ISR ausgeführt und der ATtiny ist wieder wach,
-    // anschließend geht es hier wieder weiter
-    sleep_disable();
-
-    // PC Interrupts vorübergehend wieder ignorieren
-    PCMSK &= ~((1<<PCINT0) | (1<<PCINT3));
-    //++++++++++++++++++++++++++++++++++++++++
-    
+    for (int i = 0; i < (sleepDuration/8); i++){
+      system_sleep();
+      if (f_wdt < 1) {
+        i = (sleepDuration/8);
+      }
+    }
+    //Woke up from Pin Change interrupt or Watchdog Timed Out
     // Spannungsregler einschalten
     digitalWrite(VREG_ENABLE, HIGH);
     // (Neue) Startzeit einlesen
     start_time = millis();
     // Genug geschlafen
-    goto_sleep = false;
+    goto_sleep = false;   
+    if ( f_wdt > 0) {  // watchdog signal
+      f_wdt=0;         //reset flag
+    }
   }
-  
+
   //++++++++++++++++++++++++++++++++++++++++
-  // Zustand des Schalters(PB0) auf PB1 ausgeben
+  // Forward PB0 state to PB1
   //++++++++++++++++++++++++++++++++++++++++
   digitalWrite(WAKEUP_SWITCH_STATE, digitalRead(WAKEUP_SWITCH));
   
   //++++++++++++++++++++++++++++++++++++++++
-  // Verfügbare Zeit abgelaufen ?
+  // Was the system on long enough?
   //++++++++++++++++++++++++++++++++++++++++
   if (millis()-start_time >= timerInterval*1000) 
   {
-    // Wieder schlafen gehen
+    // Need to go to sleep again
     goto_sleep = true;
   }
   
   //++++++++++++++++++++++++++++++++++++++++
-  // Ausschalt Signal erkannt ?
+  // Shutdown signal received?
   //++++++++++++++++++++++++++++++++++++++++
   if (digitalRead(VREG_SHTDN) == 1) 
   {
-    // Womögliches Prellen abfangen
+    // Try to detect false positive
     delay(100);
-    // warten bis das HIGH Signal wieder verschwindet
+    // Wait if the High signal is still detected.
     while (digitalRead(VREG_SHTDN) == 1) {};
     goto_sleep = true;
-  }
+  }  
 }
-
